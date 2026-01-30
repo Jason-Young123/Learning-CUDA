@@ -1,0 +1,215 @@
+template <typename T>
+__global__ void kernel_flashAttention(int batch_size, int target_seq_len, int src_seq_len, int q_heads, int kv_heads, int head_dim, bool is_causal, const T* Q, const T* K, const T* V, T* O, T* l, T* m){
+  int tid_x = threadIdx.x;//横向,32列
+  int tid_y = threadIdx.y;//纵向,32行
+  int bid_x = blockIdx.x;//横向,总数 = #q_heads
+  int bid_y = blockIdx.y;//纵向,总数 = #batch
+  const int p = q_heads / kv_heads;//计算比例系数
+  const int Br = 32, Bc = 32;
+  const int Tr = (target_seq_len + Br - 1) / Br;//对应原始论文中Q纵向分块数Tr,其中Br = 32
+  const int Tc = (src_seq_len + Bc - 1) / Bc;//对应原始论文中K/V纵向分块数Tc,其中Bc = 32
+  
+  const int common_index_lm = ((bid_x * batch_size) + bid_y) * target_seq_len;//用于分块加载l和m
+
+  //only for debug
+  //bool cond = (target_seq_len == 8) && (head_dim == 4) && (bid_x == 7);
+
+
+  //定义一系列临时变量
+  __shared__ T S[32][32], P[32][32];
+  __shared__ T m_tmp[32], m_new[32];
+  __shared__ T l_tmp[32], l_new[32];
+
+  //step0: reset l, m
+  if(tid_x == 0){//l和m为列向量,只更新第一列
+    for(int j = 0; j < Tr; ++j){
+      m[common_index_lm + (Br * j + tid_y)] = T(-INFINITY);
+      l[common_index_lm + (Br * j + tid_y)] = T(0);
+    }
+  }
+  __syncthreads();
+
+
+  //对应原始论文FlashAttention算法
+  for(int i = 0; i < Tc; ++i){//对于KV分块
+    for(int j = 0; j < Tr; ++j){//对于Q分块
+      
+      #ifdef DEBUG
+      if(tid_x == 0 && tid_y == 0 && cond){
+        printf("CheckPoin1: KV round is %d, Q round is %d\n", i, j);
+        //printf("m[3] is %f\n", float(m[3]));
+      }
+      #endif
+  
+      if(is_causal && (i > j)){//early exit,直接跳过
+        __syncthreads();
+        continue;
+      }
+      
+      S[tid_y][tid_x] = T(-INFINITY);
+      P[tid_y][tid_x] = T(0);
+      __syncthreads();
+      int bound_tid_y = min(Br, target_seq_len - Br * j);
+      int bound_tid_x = min(Bc, src_seq_len - Bc * i);
+      bool is_compute = !is_causal || (i < j) || (i == j && tid_y >= tid_x);
+
+      //step1: S = Q@K.T, point-wise
+      if(tid_x < bound_tid_x && tid_y < bound_tid_y){
+        //case1: (is_causal  && i < j) || !is_causal -> 完全有效,全部计算
+        //case2: (is_causal && i > j) -> 完全无效,直接跳过
+        //case3: (is_causal && i = j) -> 部分有效,计算下三角
+        T val0 = T(0);//临时sum  
+        if(is_compute){
+          for(int k = 0; k < head_dim; ++k){
+          //S[tid_y][tid_x] += Q[bid_y][Br * j + tid_y][bid_x][k] *\
+          //                  K[bid_y][Bc * i + tid_x][bid_x / p][k];
+            val0 += Q[((((bid_y * target_seq_len) + (Br * j + tid_y)) * q_heads) + bid_x) * head_dim + k] *\
+                    K[((((bid_y * src_seq_len) + (Bc * i + tid_x)) * kv_heads) + bid_x / p) * head_dim + k];
+          }
+          S[tid_y][tid_x] = val0 / T(sqrtf(head_dim));//缩放因子
+        }
+      }
+      __syncthreads();
+      #ifdef DEBUG
+      if(tid_x == 0 && tid_y == 0 && cond){
+        printf("CheckPoint2: S[32][32]\n");
+        for(int ii = 0; ii < 32; ++ii){
+          for(int jj = 0; jj < 32; ++jj){
+            printf("%f ", float(S[ii][jj]));
+          }
+          printf("\n");
+        }
+      }
+      #endif
+
+      //step2: m_tmp = rowMax(S), row-wise
+      T val = S[tid_y][tid_x];
+      val = warp_reduce_max(val);
+      if(tid_x == 0){//向量只更新第1列
+        m_tmp[tid_y] = val;
+      }
+      __syncthreads();
+      #ifdef DEBUG
+      if(tid_x == 0 && tid_y == 0 && cond){
+        printf("CheckPoint3: m_tmp[32]\n");
+        for(int i2 = 0; i2 < 32; ++i2){
+          printf("%f ", float(m_tmp[i2]));
+        }
+        printf("\n");
+      }
+      #endif
+
+      //step3: P = exp(S - m_tmp), point-wise
+      if(tid_x < bound_tid_x && tid_y < bound_tid_y){
+        if(is_compute){
+          P[tid_y][tid_x] = myexp<T>(S[tid_y][tid_x] - m_tmp[tid_y]);
+        }
+      }
+      __syncthreads();
+      #ifdef DEBUG
+      if(tid_x == 0 && tid_y == 0 && cond){
+        printf("CheckPoint4: P[32][32]\n");
+        for(int i3 = 0; i3 < 32; ++i3){
+          for(int j3 = 0; j3 < 32; ++j3){
+            printf("%f ", float(P[i3][j3]));
+          }
+          printf("\n");
+        }
+      }
+      #endif
+
+      //step4: l_tmp = rowSum(P), row-wise
+      T val1 = P[tid_y][tid_x];
+      val1 = warp_reduce_sum(val1);
+      if(tid_x == 0){//向量只更新第1列
+        l_tmp[tid_y] = val1;
+      }
+      __syncthreads();
+      #ifdef DEBUG
+      if(tid_x == 0 && tid_y == 0 && cond){
+        printf("CheckPoint5: l_tmp[32]\n");
+        for(int i4 = 0; i4 < 32; ++i4){
+          printf("%f ", float(l_tmp[i4]));
+        }
+        printf("\n");
+      }
+      #endif
+
+
+      //step5: 更新m_new, l_new
+      if(tid_x == 0 && tid_y < bound_tid_y){//向量只使用第1列线程
+        m_new[tid_y] = (m_tmp[tid_y] > m[common_index_lm + (Br * j + tid_y)]) ? m_tmp[tid_y] : m[common_index_lm + (Br * j + tid_y)];
+        /*if(tid_y == 3 && bid_x == 0 && bid_x == 0 && target_seq_len == 3){
+          printf("m_tmp is %f\n", float(m_tmp[tid_y]));
+          printf("m is %f\n", float(m[Br * j + tid_y]));
+        }*/
+      }
+      __syncthreads();
+      #ifdef DEBUG1
+      if(tid_x == 0 && tid_y == 0 && cond){
+        printf("CheckPoint6: m_new[32]\n");
+        for(int i4 = 0; i4 < 32; ++i4){
+          printf("%f ", float(m_new[i4]));
+        }
+        printf("\n");
+      }
+      #endif
+      
+      if(tid_x == 0 && tid_y < bound_tid_y){//向量只使用第1列线程
+        l_new[tid_y] = myexp<T>(m[common_index_lm + (Br * j + tid_y)] - m_new[tid_y]) * l[common_index_lm + (Br * j + tid_y)] + myexp<T>(m_tmp[tid_y] - m_new[tid_y]) * l_tmp[tid_y];
+      }
+      __syncthreads();
+      #ifdef DEBUG1
+      if(tid_x == 0 && tid_y == 0 && cond){
+        printf("CheckPoint7: l_new[32]\n");
+        for(int i4 = 0; i4 < 32; ++i4){
+          printf("%f ", float(l_new[i4]));
+        }
+        printf("\n");
+      }
+      #endif
+
+      //step6: O = diag(l_new)^-1 * [diag(l) * exp(m - m_new) * O + exp(m_tmp - m_new) * P * V]
+      if(tid_x == 0 && tid_y < bound_tid_y){//32路并行计算Oi的每一行
+        for(int u = 0; u < head_dim; ++u){
+          T val2 = T(0);
+          for(int w = 0; w < Bc; ++w){
+            //val2 += P[tid_y][w] * V[bid_y][Bc * i + w][bid_x / p][u];
+            val2 += P[tid_y][w] * V[((((bid_y * src_seq_len) + (Bc * i + w)) * kv_heads) + (bid_x / p)) * head_dim + u];
+          }
+          #ifdef DEBUG2
+          if(tid_x == 0 && tid_y == 2 && bid_x == 0 && target_seq_len == 3){
+            printf("CheckPoint8: dim = %d, val2 = %f\n", u, float(val2));
+          }
+          #endif
+
+          //O[bid_y][Br * j + tid_y][bid_x][u] =
+          O[ ((((bid_y * target_seq_len) + (Br * j + tid_y)) * q_heads) + bid_x) * head_dim + u ] =\
+            T(1)/l_new[tid_y] * l[common_index_lm + (Br * j + tid_y)] * myexp<T>(m[common_index_lm + (Br * j + tid_y)] - m_new[tid_y]) * O[ ((((bid_y * target_seq_len) + (Br * j + tid_y)) * q_heads) + bid_x) * head_dim + u ] +\
+            T(1)/l_new[tid_y] * myexp<T>(m_tmp[tid_y] - m_new[tid_y]) * val2;
+          #ifdef DEBUG2
+          if(tid_x == 0 && tid_y == 2 && bid_x == 0 && target_seq_len == 3){
+            printf("CheckPoint9: dim = %d, O = %f\n", u, float(O[ ((((bid_y * target_seq_len) + (Br * j + tid_y)) * q_heads) + bid_x) * head_dim + u ]));
+          }
+          #endif
+        }
+      }
+      __syncthreads();
+
+      //step7: 更新m和l
+      if (tid_x == 0 && tid_y < bound_tid_y) {//向量更新只使用第1列线程
+        m[common_index_lm + (Br * j + tid_y)] = m_new[tid_y];
+        l[common_index_lm + (Br * j + tid_y)] = l_new[tid_y];
+        //printf("modify m, bid_x = %d, bid_y = %d, tid_x = %d, tid_y = %d, value = %f, index = %d + %d\n", bid_x, bid_y, tid_x, tid_y, float(m_new[tid_y]), common_index_lm, Br * j + tid_y);
+      }
+      __syncthreads();
+
+      #ifdef DEBUG2
+          if(tid_x == 0 && tid_y == 0 && bid_x == 0 && target_seq_len == 3){
+            printf("CheckPoint10: %f, %f, %f, %f, %f, %f\n", float(O[0]), float(O[1]), float(O[6]), float(O[7]), float(O[12]), float(O[13]));
+          }
+      #endif
+
+    }
+  }
+}

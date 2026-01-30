@@ -1,0 +1,534 @@
+#include <vector>
+#include <cuda_fp16.h>
+
+#include "../tester/utils.h"
+
+//#define DEBUG
+
+#ifdef DEBUG
+  #include <iomanip>
+#endif
+
+/**
+ * @brief Computes the trace of a matrix.
+ *
+ * The trace of a matrix is defined as the sum of its diagonal elements.
+ * This function expects a flattened row-major matrix stored in a
+ * std::vector. If the matrix is not square, the trace will sum up
+ * elements along the main diagonal up to the smaller of rows or cols.
+ *
+ * @tparam T The numeric type of matrix elements (e.g., float, int).
+ * @param h_input A flattened matrix of size rows * cols.
+ * @param rows Number of rows in the matrix.
+ * @param cols Number of columns in the matrix.
+ * @return The trace (sum of diagonal values) of the matrix.
+ */
+
+template <typename T>
+__device__ T warp_reduce_sum(T val){
+#pragma unroll//短循环自动展开,省去分支预测,提升效率
+    for(int offset = 16; offset > 0; offset >>= 1){
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+template <typename T>
+__global__ void trace_calc(T* result, const T* d_input, size_t rows, size_t cols){
+  __shared__ T smem[32];
+  int tid = threadIdx.x;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = gridDim.x * blockDim.x;
+
+  //size_t n = rows * cols;//元素总数
+  size_t bound = min(rows, cols);
+  size_t max_index = (bound - 1) * (cols + 1);//有效元素索引最大值
+
+  //通过两级归约(warp内, block内/warp间)完成所有对角元素相加
+  const size_t start_index = idx * (cols + 1);
+  const size_t step = stride * (cols + 1);
+  T sum = 0;
+  #pragma unroll 4
+  for(size_t i = start_index; i <= max_index; i += step){
+    sum += d_input[i];//找到所有对角元的索引
+  }
+  //一级归约,每个warp内完成规约
+  T warp_sum = warp_reduce_sum(sum);
+
+  //若数据量不足32,则一级归约后直接退出、跳过二级归约流程
+  if(bound <= 32 && idx == 0){
+    *result = warp_sum;
+    return;
+  }
+
+  //准备二级规约,将每个warp内lane[0]的值拷贝到smem中
+  if((tid % 32) == 0){
+      smem[tid / 32] = warp_sum;
+  }
+  __syncthreads();//等待拷贝至smem操作完成
+
+  //需保证一级归约后每个block内的线程不超过32(即block_dim不超过32*32 = 1024)
+  if(tid < 32){
+      //准备二级规约,多余线程补0
+      T block_sum = (tid < (blockDim.x + 31)/32) ? smem[tid] : T(0);
+      //二级归约
+      block_sum = warp_reduce_sum(block_sum);
+      if(tid == 0 && block_sum != T(0)){//原子操作次数 = block数量
+        atomicAdd(result, block_sum);
+      }
+  }  
+  return;
+}
+
+
+template <typename T>
+T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
+  // TODO: Implement the trace function
+
+  //step0: basic check
+  if(!min(rows, cols)){
+    //std::cerr << "Matrix Shape Invalid" << std::endl;
+    return T(0);
+  }
+
+  //step1: 初始化host端设备(直接从h_input获取),预留device端空间
+  const size_t size_bytes = h_input.size() * sizeof(T);
+  T *d_input, *d_result;//device端只支持裸指针
+  RUNTIME_CHECK(cudaMalloc(&d_input, size_bytes));
+  RUNTIME_CHECK(cudaMalloc(&d_result, sizeof(T)));
+
+  //step2: 拷贝数据from host to device
+  RUNTIME_CHECK(cudaMemcpy(d_input, h_input.data(), size_bytes, cudaMemcpyHostToDevice));
+
+  //step3: device端计算
+  int block_dim = 1024;
+  int grid_dim = min((min(rows, cols) + block_dim - 1)/block_dim, size_t(8));//设置上限
+  
+  trace_calc<T><<<grid_dim, block_dim>>>(d_result, d_input, rows, cols);//调用device端函数进行trace计算
+  //注意核函数返回类型只能为void
+
+  //step4: 拷贝数据from device to host
+  T h_result = T(0);
+  cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost);
+
+  //step5: free memory
+  RUNTIME_CHECK(cudaFree(d_input));
+  RUNTIME_CHECK(cudaFree(d_result));
+
+  return h_result;
+}
+
+
+
+
+
+
+/**
+ * @brief Computes flash attention for given query, key, and value tensors.
+ * 
+ * @tparam T Data type (float) for input/output tensors
+ * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
+ * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
+ * @param[in] h_v Value tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
+ * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
+ * @param[in] batch_size Batch dimension size
+ * @param[in] target_seq_len Target sequence length
+ * @param[in] src_seq_len Source sequence length  
+ * @param[in] query_heads Number of query attention heads
+ * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
+ * @param[in] head_dim Dimension size of each attention head
+ * @param[in] is_causal Whether to apply causal masking
+ */
+
+/*template <typename T>
+__device__ __noinline__ T myexp(T x) {
+    if constexpr (std::is_same<T, __half>::value) {//针对half
+        //return hexp(x);
+        return __float2half(expf(__half2float(x)));
+    } else if constexpr (std::is_same<T, float>::value) {//针对float
+        return expf(x);
+    } else if constexpr (std::is_same<T, double>::value) {//针对double,此处用不到
+        return exp(x);
+    } else {//类型匹配失败,返回0
+        return T(0);
+    }
+}*/
+
+template <typename T>
+__device__ T myexp(T x) {
+    if constexpr (std::is_same<T, __half>::value) {
+        float fx = __half2float(x);
+        float result = expf(fx);
+        return __float2half(result);
+    } else {
+        float fx = static_cast<float>(x);
+        return static_cast<T>(expf(fx));
+    }
+}
+
+
+template <typename T>
+__device__ T warp_reduce_max(T val){
+#pragma unroll//短循环自动展开,省去分支预测,提升效率
+    for(int offset = 16; offset > 0; offset >>= 1){
+        T tmp = __shfl_down_sync(0xffffffff, val, offset);
+        val = (val > tmp) ? val : tmp;
+    }
+    return val;
+}
+
+
+//完成32x32矩阵求rowMax功能
+template <typename T>
+__device__ void rowMax(const T* src, T* dst){
+  int tid_x = threadIdx.x;//横向,32列
+  int tid_y = threadIdx.y;//纵向,32行
+
+  T val = src[tid_y * 32 + tid_x];
+
+  val = warp_reduce_max(val);//按行归约,因为同一warp的线程共享相同的threadIdx.y（行索引）
+
+  if(tid_x == 0){
+    dst[tid_y] = val;
+  }
+}
+
+//完成32x32矩阵求rowSoftmax功能
+template <typename T>
+__device__ void rowSoftmax(T* src, T* m, T* l){
+  int tid_x = threadIdx.x;//横向,32列
+  int tid_y = threadIdx.y;//纵向,32行
+
+  //定义临时m和l向量
+  __shared__ T m_tmp[32];
+  __shared__ T m_new[32];
+  __shared__ T l_tmp[32];
+  __shared__ T l_new[32];
+
+  //step1: m = rowMax(src), row-wise
+  T val = src[tid_y * 32 + tid_x];
+  val = warp_reduce_max(val);//按行归约,因为同一warp的线程共享相同的threadIdx.y（行索引）
+  if(tid_x == 0){
+    m_tmp[tid_y] = val;
+  }
+  __syncthreads();
+
+  //step2: P = exp(src - m), point-wise
+  src[tid_y * 32 + tid_x] = myexp(src[tid_y * 32 + tid_x] - m_tmp[tid_y]);
+  __syncthreads();
+
+  //step3: l = rowSum(P), row-wise
+  T val1 = src[tid_y * 32 + tid_x];
+  val1 = warp_reduce_sum(val1);//按行归约
+  if(tid_x == 0){
+    l_tmp[tid_y] = val1;
+  }
+  __syncthreads();
+
+  //step4: 对入口参数m进行更新
+  m_new[tid_y] = (m_tmp[tid_y] > m[tid_y]) ? m_tmp[tid_y] : m[tid_y];
+  __syncthreads();
+
+  l_new[tid_y] = myexp<T>(m[tid_y] - m_new[tid_y]) * l[tid_y] + myexp<T>(m_tmp[tid_y] - m_new[tid_y]) * l_tmp[tid_y];
+  __syncthreads();
+}
+
+
+
+
+template <typename T>
+__global__ void kernel_flashAttention(int batch_size, int target_seq_len, int src_seq_len, int q_heads, int kv_heads, int head_dim, bool is_causal, const T* Q, const T* K, const T* V, T* O, T* l, T* m){
+  int tid_x = threadIdx.x;//横向,32列
+  int tid_y = threadIdx.y;//纵向,32行
+  int bid_x = blockIdx.x;//横向,总数 = #q_heads
+  int bid_y = blockIdx.y;//纵向,总数 = #batch
+  const int p = q_heads / kv_heads;//计算比例系数
+  const int Br = 32, Bc = 32;
+  const int Tr = (target_seq_len + Br - 1) / Br;//对应原始论文中Q纵向分块数Tr,其中Br = 32
+  const int Tc = (src_seq_len + Bc - 1) / Bc;//对应原始论文中K/V纵向分块数Tc,其中Bc = 32
+  
+  const int common_index_lm = ((bid_x * batch_size) + bid_y) * target_seq_len;//用于分块加载l和m
+
+  //only for debug
+  bool cond = (target_seq_len == 16) && (head_dim == 8) && (q_heads == 16) && (bid_x == 12) && (bid_y == 1);
+
+  //定义一系列临时变量
+  __shared__ float SP[32][32];//复用S和P
+  __shared__ float m_tmp[32], m_new[32];
+  __shared__ float l_tmp[32], l_new[32];
+
+  //step0: reset l, m
+  if(tid_x == 0){//l和m为列向量,只更新第一列
+    for(int j = 0; j < Tr; ++j){
+      m[common_index_lm + (Br * j + tid_y)] = T(-8192.0f);
+      l[common_index_lm + (Br * j + tid_y)] = T(0);
+    }
+  }
+  __syncthreads();
+
+
+  //对应原始论文FlashAttention算法
+  for(int i = 0; i < Tc; ++i){//对于KV分块
+    for(int j = 0; j < Tr; ++j){//对于Q分块
+
+      #ifdef DEBUG
+      if(tid_x == 0 && tid_y == 0 && cond){
+        printf("CheckPoin1: KV round is %d, Q round is %d\n", i, j);
+        //printf("m[3] is %f\n", float(m[3]));
+      }
+      #endif
+  
+      if(is_causal && (i > j)){//early exit,直接跳过
+        __syncthreads();
+        continue;
+      }
+      
+      SP[tid_y][tid_x] = float(-8192.0f);
+      //P[tid_y][tid_x] = T(0);
+      __syncthreads();
+      int bound_tid_y = min(Br, target_seq_len - Br * j);
+      int bound_tid_x = min(Bc, src_seq_len - Bc * i);
+      bool is_compute = !is_causal || (i < j) || (i == j && tid_y >= tid_x);
+
+      //step1: S = Q@K.T, point-wise
+      if(tid_x < bound_tid_x && tid_y < bound_tid_y){
+        //case1: (is_causal  && i < j) || !is_causal -> 完全有效,全部计算
+        //case2: (is_causal && i > j) -> 完全无效,直接跳过
+        //case3: (is_causal && i = j) -> 部分有效,计算下三角
+        float val0 = float(0);//临时sum  
+        if(is_compute){
+          for(int k = 0; k < head_dim; ++k){
+          //S[tid_y][tid_x] += Q[bid_y][Br * j + tid_y][bid_x][k] *\
+          //                  K[bid_y][Bc * i + tid_x][bid_x / p][k];
+            val0 += float(Q[((((bid_y * target_seq_len) + (Br * j + tid_y)) * q_heads) + bid_x) * head_dim + k]) *\
+                    float(K[((((bid_y * src_seq_len) + (Bc * i + tid_x)) * kv_heads) + bid_x / p) * head_dim + k]);
+          
+
+            #ifdef DEBUG1
+              if(tid_x == 0 && tid_y == 0 && cond){
+                printf("current k is %d\n", k);
+                printf("current q is %f, current k is %f\n", float(Q[((((bid_y * target_seq_len) + (Br * j + tid_y)) * q_heads) + bid_x) * head_dim + k]), float(K[((((bid_y * src_seq_len) + (Bc * i + tid_x)) * kv_heads) + bid_x / p) * head_dim + k]));
+                printf("current q * k is %f\n", float(Q[((((bid_y * target_seq_len) + (Br * j + tid_y)) * q_heads) + bid_x) * head_dim + k] * K[((((bid_y * src_seq_len) + (Bc * i + tid_x)) * kv_heads) + bid_x / p) * head_dim + k]));
+                printf("current val0 is %f\n", float(val0));
+              }
+            #endif
+          
+          }
+          //SP[tid_y][tid_x] = val0;
+          SP[tid_y][tid_x] = val0 / sqrtf(head_dim);//缩放因子
+        }
+      }
+      __syncthreads();
+      #ifdef DEBUG1
+      if(tid_x == 0 && tid_y == 0 && cond){
+        printf("CheckPoint2: S[32][32]\n");
+        for(int ii = 0; ii < 32; ++ii){
+          for(int jj = 0; jj < 32; ++jj){
+            printf("%f ", float(SP[ii][jj]));
+          }
+          printf("\n");
+        }
+      }
+      #endif
+
+      //step2: m_tmp = rowMax(S), row-wise
+      float val = SP[tid_y][tid_x];
+      val = warp_reduce_max(val);
+      if(tid_x == 0){//向量只更新第1列
+        m_tmp[tid_y] = val;
+      }
+      __syncthreads();
+
+      //step3: P = exp(S - m_tmp), point-wise
+      if(tid_x < bound_tid_x && tid_y < bound_tid_y){
+        if(is_compute){
+          SP[tid_y][tid_x] = myexp<float>(SP[tid_y][tid_x] - m_tmp[tid_y]);
+        }
+        else{
+          SP[tid_y][tid_x] = float(0);
+        }
+      }
+      else{
+        SP[tid_y][tid_x] = float(0);
+      }
+      __syncthreads();
+
+      //step4: l_tmp = rowSum(P), row-wise
+      float val1 = SP[tid_y][tid_x];
+      val1 = warp_reduce_sum(val1);
+      if(tid_x == 0){//向量只更新第1列
+        l_tmp[tid_y] = val1;
+      }
+
+
+      //step5: 更新m_new, l_new
+      if(tid_x == 0 && tid_y < bound_tid_y){//向量只使用第1列线程
+        m_new[tid_y] = (m_tmp[tid_y] > float(m[common_index_lm + (Br * j + tid_y)])) ? m_tmp[tid_y] : float(m[common_index_lm + (Br * j + tid_y)]);
+      }
+      __syncthreads();
+      if(tid_x == 0 && tid_y < bound_tid_y){//向量只使用第1列线程
+        l_new[tid_y] = myexp<float>(float(m[common_index_lm + (Br * j + tid_y)]) - m_new[tid_y]) * float(l[common_index_lm + (Br * j + tid_y)]) + myexp<float>(m_tmp[tid_y] - m_new[tid_y]) * l_tmp[tid_y];
+      }
+      __syncthreads();
+
+
+      //step6: O = diag(l_new)^-1 * [diag(l) * exp(m - m_new) * O + exp(m_tmp - m_new) * P * V]
+      if(tid_x == 0 && tid_y < bound_tid_y){//32路并行计算Oi的每一行
+        for(int u = 0; u < head_dim; ++u){
+          float val2 = T(0);
+          for(int w = 0; w < Bc; ++w){
+            //val2 += P[tid_y][w] * V[bid_y][Bc * i + w][bid_x / p][u];
+            val2 += SP[tid_y][w] * float(V[((((bid_y * src_seq_len) + (Bc * i + w)) * kv_heads) + (bid_x / p)) * head_dim + u]);
+          }
+          //O[bid_y][Br * j + tid_y][bid_x][u] =
+          O[ ((((bid_y * target_seq_len) + (Br * j + tid_y)) * q_heads) + bid_x) * head_dim + u ] =\
+            T(float(1.0)/l_new[tid_y] * (float(l[common_index_lm + (Br * j + tid_y)]) * myexp<float>(float(m[common_index_lm + (Br * j + tid_y)]) - m_new[tid_y]) * float(O[ ((((bid_y * target_seq_len) + (Br * j + tid_y)) * q_heads) + bid_x) * head_dim + u ]) +\
+                                  myexp<float>(m_tmp[tid_y] - m_new[tid_y]) * val2));
+        }
+      }
+      __syncthreads();
+
+      //step7: 更新m和l
+      if (tid_x == 0 && tid_y < bound_tid_y) {//向量更新只使用第1列线程
+        m[common_index_lm + (Br * j + tid_y)] = T(m_new[tid_y]);
+        l[common_index_lm + (Br * j + tid_y)] = T(l_new[tid_y]);
+      }
+      __syncthreads();
+    }
+  }
+}
+
+
+
+template <typename T>
+void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
+                    const std::vector<T>& h_v, std::vector<T>& h_o,
+                    int batch_size, int target_seq_len, int src_seq_len, 
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+  //step0: basic check
+
+  //step1: 初始化,预留device端空间
+  const size_t size_bytes_q = h_q.size() * sizeof(T);
+  const size_t size_bytes_k = h_k.size() * sizeof(T);
+  const size_t size_bytes_v = h_v.size() * sizeof(T);
+  const size_t size_bytes_o = h_o.size() * sizeof(T);
+  const size_t size_bytes_lm = target_seq_len * query_heads * batch_size * sizeof(T);
+  T *d_q, *d_k, *d_v, *d_o, *d_m, *d_l;//device端只支持裸指针
+  RUNTIME_CHECK(cudaMalloc(&d_q, size_bytes_q));
+  RUNTIME_CHECK(cudaMalloc(&d_k, size_bytes_k));
+  RUNTIME_CHECK(cudaMalloc(&d_v, size_bytes_v));
+  RUNTIME_CHECK(cudaMalloc(&d_o, size_bytes_o));
+  RUNTIME_CHECK(cudaMalloc(&d_l, size_bytes_lm));//l向量,长度 = target_seq_len
+  RUNTIME_CHECK(cudaMalloc(&d_m, size_bytes_lm));//m向量,长度 = target_seq_len
+
+  //step2: 拷贝数据from host to device
+  RUNTIME_CHECK(cudaMemcpy(d_q, h_q.data(), size_bytes_q, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_k, h_k.data(), size_bytes_k, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), size_bytes_v, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemset(d_o, 0, size_bytes_o));//d_o初始化为全0
+
+  //step3: device端计算
+  dim3 block_dim(32, 32);
+  dim3 grid_dim(query_heads, batch_size);
+  
+  kernel_flashAttention<T><<<grid_dim, block_dim>>>(batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, is_causal, d_q, d_k, d_v, d_o, d_l, d_m);//调用device端函数进行trace计算
+  //注意核函数返回类型只能为void
+
+  //step4: 拷贝数据from device to host(not needed)
+  cudaMemcpy(h_o.data(), d_o, size_bytes_o, cudaMemcpyDeviceToHost);
+
+  //step5: free memory
+  RUNTIME_CHECK(cudaFree(d_q));
+  RUNTIME_CHECK(cudaFree(d_k));
+  RUNTIME_CHECK(cudaFree(d_v));
+  RUNTIME_CHECK(cudaFree(d_o));
+  RUNTIME_CHECK(cudaFree(d_l));
+  RUNTIME_CHECK(cudaFree(d_m));
+
+
+  /*std::cout << "info disp: " << std::endl;
+  std::cout << "h_q.size() is: " << h_q.size() << std::endl;
+  std::cout << "h_k.size() is: " << h_k.size() << std::endl;
+  std::cout << "h_v.size() is: " << h_v.size() << std::endl;
+  std::cout << "batch_size is: " << batch_size << std::endl;
+  std::cout << "target_seq_length is: " << target_seq_len << std::endl;
+  std::cout << "src_seq_length is: " << src_seq_len << std::endl;
+  std::cout << "#q heads is: " << query_heads << std::endl;
+  std::cout << "#kv heads is: " << kv_heads << std::endl;
+  std::cout << "head_dim is: " << head_dim << std::endl;
+  std::cout << "is_causal is: " << is_causal << std::endl;
+  */
+  //std::cout << "h_o[0] is: " << float(h_o[0]) << std::endl;
+  
+  /*const int batch_id = 1; 
+  const int q_head_id = 12;
+  const int kv_head_id = q_head_id / 2;
+
+  if(h_q.size() == 4096){
+    std::cout << "Q: " << std::endl;
+    for(int i = 0; i < target_seq_len; ++i){
+      for(int j = 0; j < head_dim; ++j){
+        std::cout << std::setprecision(std::numeric_limits<float>::max_digits10) <<\
+        float(h_q[(((batch_id * target_seq_len) + i) * query_heads + q_head_id) * head_dim + j]) << " ";
+        //std::cout << float(h_q[i * 32 + j]) << " ";
+      }
+      std::cout << std::endl;
+    }
+
+    std::cout << "K: " << std::endl;
+    for(int i = 0; i < src_seq_len; ++i){
+      for(int j = 0; j < head_dim; ++j){
+        std::cout << std::setprecision(std::numeric_limits<float>::max_digits10) <<\
+        float(h_k[(((batch_id * src_seq_len) + i) * kv_heads + kv_head_id) * head_dim + j]) << " ";
+        //std::cout << float(h_k[i * 16 + j]) << " ";
+      }
+      std::cout << std::endl;
+    }
+
+    std::cout << "V: " << std::endl;
+    for(int i = 0; i < src_seq_len; ++i){
+      for(int j = 0; j < head_dim; ++j){
+        std::cout << float(h_v[(((batch_id * src_seq_len) + i) * kv_heads + kv_head_id) * head_dim + j]) << " ";
+        //std::cout << float(h_v[i * 16 + j]) << " ";
+      }
+      std::cout << std::endl;
+    }
+
+    std::cout << "O(calc): " << std::endl;
+    for(int i = 0; i < target_seq_len; ++i){
+      for(int j = 0; j < head_dim; ++j){
+        std::cout << std::setprecision(std::numeric_limits<float>::max_digits10) <<\
+        float(h_o[(((batch_id * target_seq_len) + i) * query_heads + q_head_id) * head_dim + j]) << " ";
+        //std::cout << float(h_o[i * 32 + j]) << " ";
+      }
+      std::cout << std::endl;
+    }
+
+  }*/
+
+  return;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+// *********************************************************************
+// Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
+// DO NOT MODIFY THIS SECTION
+// *********************************************************************
+template int trace<int>(const std::vector<int>&, size_t, size_t);
+template float trace<float>(const std::vector<float>&, size_t, size_t);
+template void flashAttention<float>(const std::vector<float>&, const std::vector<float>&,
+  const std::vector<float>&, std::vector<float>&,
+  int, int, int, int, int, int, bool);
+template void flashAttention<half>(const std::vector<half>&, const std::vector<half>&,
+  const std::vector<half>&, std::vector<half>&,
+  int, int, int, int, int, int, bool);

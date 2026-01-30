@@ -1,0 +1,291 @@
+=== Compiling student code (src/kernels.cu ) ===
+nvcc -std=c++17 -O0 -DPLATFORM_NVIDIA -c src/kernels.cu -o src/kernels.o
+=== Linking executable (student code + test logic) ===
+nvcc -std=c++17 -O0 -DPLATFORM_NVIDIA -o test_kernels src/kernels.o tester/tester_nv.o 
+=== Running tests (output from src/kernels.o) ===
+=== Verbose mode: Enabled (using '--verbose') ===
+./test_kernels  --verbose
+Running tests on device: NVIDIA GeForce RTX 5090 Laptop GPU
+Max shared memory per block: 49152 bytes
+Malloc heap size: 134217728 bytes
+============================================================
+info disp: 
+h_q.size() is: 1
+h_k.size() is: 1024
+h_v.size() is: 1024
+batch_size is: 1
+target_seq_length is: 1
+src_seq_length is: 1024
+#q heads is: 1
+#kv heads is: 1
+head_dim is: 1
+is_causal is: 1
+Test Case #1 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       1.108912 ms
+Max Diff:       0.0000000
+Max Tolerance:  0.0000000
+Verification:   [32mPassed[0m
+============================================================
+info disp: 
+h_q.size() is: 18
+h_k.size() is: 6
+h_v.size() is: 6
+batch_size is: 1
+target_seq_length is: 3
+src_seq_length is: 3
+#q heads is: 3
+#kv heads is: 1
+head_dim is: 2
+is_causal is: 1
+Test Case #2 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       0.805381 ms
+Max Diff:       0.0000000
+Max Tolerance:  0.0000000
+Verification:   [32mPassed[0m
+============================================================
+info disp: 
+h_q.size() is: 256
+h_k.size() is: 128
+h_v.size() is: 128
+batch_size is: 1
+target_seq_length is: 8
+src_seq_length is: 8
+#q heads is: 8
+#kv heads is: 4
+head_dim is: 4
+is_causal is: 0
+Test Case #3 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       0.825152 ms
+Max Diff:       0.0000010
+Max Tolerance:  0.0000786
+Verification:   [32mPassed[0m
+============================================================
+info disp: 
+h_q.size() is: 4096
+h_k.size() is: 2048
+h_v.size() is: 2048
+batch_size is: 2
+target_seq_length is: 16
+src_seq_length is: 16
+#q heads is: 16
+#kv heads is: 8
+head_dim is: 8
+is_causal is: 1
+Test Case #4 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       0.879985 ms
+Max Diff:       0.0000045
+Max Tolerance:  0.0000016
+Verification:   [31mFailed[0m
+============================================================
+info disp: 
+h_q.size() is: 16384
+h_k.size() is: 8192
+h_v.size() is: 8192
+batch_size is: 1
+target_seq_length is: 32
+src_seq_length is: 32
+#q heads is: 32
+#kv heads is: 16
+head_dim is: 16
+is_causal is: 0
+Test Case #5 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       0.887403 ms
+Max Diff:       0.0000048
+Max Tolerance:  0.0000905
+Verification:   [32mPassed[0m
+============================================================
+info disp: 
+h_q.size() is: 524288
+h_k.size() is: 262144
+h_v.size() is: 262144
+batch_size is: 4
+target_seq_length is: 64
+src_seq_length is: 64
+#q heads is: 64
+#kv heads is: 32
+head_dim is: 32
+is_causal is: 1
+Test Case #6 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       2.849849 ms
+Max Diff:       0.0000046
+Max Tolerance:  0.0000016
+Verification:   [31mFailed[0m
+============================================================
+info disp: 
+h_q.size() is: 512
+h_k.size() is: 128
+h_v.size() is: 128
+batch_size is: 1
+target_seq_length is: 8
+src_seq_length is: 8
+#q heads is: 8
+#kv heads is: 2
+head_dim is: 8
+is_causal is: 0
+Test Case #7 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       0.648322 ms
+Max Diff:       0.0000043
+Max Tolerance:  0.0000328
+Verification:   [32mPassed[0m
+============================================================
+info disp: 
+h_q.size() is: 512
+h_k.size() is: 128
+h_v.size() is: 128
+batch_size is: 1
+target_seq_length is: 8
+src_seq_length is: 8
+#q heads is: 8
+#kv heads is: 2
+head_dim is: 8
+is_causal is: 1
+Test Case #8 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       0.430692 ms
+Max Diff:       0.0000019
+Max Tolerance:  0.0000975
+Verification:   [32mPassed[0m
+============================================================
+info disp: 
+h_q.size() is: 3072
+h_k.size() is: 768
+h_v.size() is: 768
+batch_size is: 2
+target_seq_length is: 16
+src_seq_length is: 16
+#q heads is: 12
+#kv heads is: 3
+head_dim is: 8
+is_causal is: 0
+Test Case #9 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       0.436436 ms
+Max Diff:       0.0000034
+Max Tolerance:  0.0000024
+Verification:   [31mFailed[0m
+============================================================
+info disp: 
+h_q.size() is: 8192
+h_k.size() is: 2048
+h_v.size() is: 2048
+batch_size is: 1
+target_seq_length is: 64
+src_seq_length is: 64
+#q heads is: 16
+#kv heads is: 4
+head_dim is: 8
+is_causal is: 1
+Test Case #10 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       0.582120 ms
+Max Diff:       0.0000150
+Max Tolerance:  0.0000043
+Verification:   [31mFailed[0m
+============================================================
+info disp: 
+h_q.size() is: 2048
+h_k.size() is: 2048
+h_v.size() is: 2048
+batch_size is: 1
+target_seq_length is: 16
+src_seq_length is: 32
+#q heads is: 8
+#kv heads is: 4
+head_dim is: 16
+is_causal is: 1
+Test Case #11 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       0.637511 ms
+Max Diff:       0.0000019
+Max Tolerance:  0.0000985
+Verification:   [32mPassed[0m
+============================================================
+info disp: 
+h_q.size() is: 16384
+h_k.size() is: 2048
+h_v.size() is: 2048
+batch_size is: 2
+target_seq_length is: 32
+src_seq_length is: 16
+#q heads is: 16
+#kv heads is: 4
+head_dim is: 16
+is_causal is: 0
+Test Case #12 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       0.562696 ms
+Max Diff:       0.0000029
+Max Tolerance:  0.0000973
+Verification:   [32mPassed[0m
+============================================================
+info disp: 
+h_q.size() is: 1048576
+h_k.size() is: 1048576
+h_v.size() is: 1048576
+batch_size is: 2
+target_seq_length is: 256
+src_seq_length is: 256
+#q heads is: 32
+#kv heads is: 32
+head_dim is: 64
+is_causal is: 0
+Test Case #13 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       8.390322 ms
+Max Diff:       0.0000076
+Max Tolerance:  0.0000911
+Verification:   [32mPassed[0m
+============================================================
+info disp: 
+h_q.size() is: 4194304
+h_k.size() is: 16777216
+h_v.size() is: 16777216
+batch_size is: 4
+target_seq_length is: 512
+src_seq_length is: 2048
+#q heads is: 64
+#kv heads is: 64
+head_dim is: 32
+is_causal is: 1
+Test Case #14 (Attention)
+Data Type:      [36mfloat[0m
+Warm-up Iters:  1
+Profile Iters:  10
+Avg Time:       45.535151 ms
+Max Diff:       0.0000039
+Max Tolerance:  0.0000030
+Verification:   [31mFailed[0m
+============================================================

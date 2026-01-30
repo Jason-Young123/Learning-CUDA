@@ -1,7 +1,8 @@
 #include <vector>
-#include <common/maca_fp16.h>
+#include <cuda_fp16.h>
 
 #include "../tester/utils.h"
+
 
 /**
  * @brief Computes the trace of a matrix.
@@ -17,7 +18,6 @@
  * @param cols Number of columns in the matrix.
  * @return The trace (sum of diagonal values) of the matrix.
  */
-
 
 template <typename T>
 __device__ T warp_reduce_sum(T val){
@@ -79,21 +79,6 @@ std::vector<T> extract_diag(const std::vector<T> & h_input, size_t rows, size_t 
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   //step-0: basic check
-  //printf("=== MACA Device Properties ===\n");
-  //mcDeviceProp_t prop; 
-  //int device_id = 0; 
-  //mcGetDeviceProperties(&prop, device_id);
-  
-  // 静态property
-  //printf("Device Name: %s\n", prop.name);
-  //printf("  - Max Threads per Block: %d\n", prop.maxThreadsPerBlock);//1024
-  //printf("  - Max Block Dimensions: (%d, %d, %d)\n", prop.maxThreadsDim[0], prop.maxThreadsDim[1], prop.maxThreadsDim[2]);//(1024, 1024, 1024)
-  //printf("  - Max Grid Dimensions: (%d, %d, %d)\n", prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);//(2147483647, 2147483647, 2147483647)
-  //printf("  - Warp Size: %d\n", prop.warpSize);//64
-  //printf("  - Shared Memory per Block: %zu bytes\n", prop.sharedMemPerBlock);//64KB
-  //printf("  - Number of Multiprocessors: %d\n", prop.multiProcessorCount);//104
-
-
   if(!std::min(rows, cols)){
     //std::cerr << "Matrix Shape Invalid" << std::endl;
     return T(0);
@@ -105,12 +90,12 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   //step-2: 初始化,分配device端空间
   const size_t size_bytes = h_diag.size() * sizeof(T);
   T *d_diag, *d_trace;//device端只支持裸指针
-  RUNTIME_CHECK(mcMalloc(&d_diag, size_bytes));
-  RUNTIME_CHECK(mcMalloc(&d_trace, sizeof(T)));
+  RUNTIME_CHECK(cudaMalloc(&d_diag, size_bytes));
+  RUNTIME_CHECK(cudaMalloc(&d_trace, sizeof(T)));
 
   //step-3: 拷贝数据from host to device
-  RUNTIME_CHECK(mcMemcpy(d_diag, h_diag.data(), size_bytes, mcMemcpyHostToDevice));
-  RUNTIME_CHECK(mcMemset(d_trace, 0, sizeof(T)));
+  RUNTIME_CHECK(cudaMemcpy(d_diag, h_diag.data(), size_bytes, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemset(d_trace, 0, sizeof(T)));
 
   //step-4: device端计算
   int block_dim = 1024;
@@ -120,15 +105,17 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
   //step-5: 拷贝数据from device to host
   T h_trace = T(0);
-  RUNTIME_CHECK(mcMemcpy(&h_trace, d_trace, sizeof(T), mcMemcpyDeviceToHost));
+  RUNTIME_CHECK(cudaMemcpy(&h_trace, d_trace, sizeof(T), cudaMemcpyDeviceToHost));
 
   //step5: free memory
-  RUNTIME_CHECK(mcFree(d_diag));
-  RUNTIME_CHECK(mcFree(d_trace));
+  RUNTIME_CHECK(cudaFree(d_diag));
+  RUNTIME_CHECK(cudaFree(d_trace));
 
-  //printf("the result is %f\n", float(h_trace));
   return h_trace;
 }
+
+
+
 
 
 
@@ -196,7 +183,7 @@ __global__ void kernel_flashAttention(int batch_size, int target_seq_len, int sr
   const int Tc = (src_seq_len + Bc - 1) / Bc;//对应原始论文中K/V纵向分块数Tc,其中Bc = 32
 
   //预计算常量
-  const double scale_factor = 1.0 / sqrt(double(head_dim));//保留精度,采用double
+  const double scale_factor = 1.0 / sqrt(double(head_dim));
 
   //定义一系列临时变量
   /*__shared__ double SP[Br][Bc];//复用S和P
@@ -210,26 +197,26 @@ __global__ void kernel_flashAttention(int batch_size, int target_seq_len, int sr
 
   extern __shared__ char shared_mem[];
   char* ptr = shared_mem;  
-  //计算中间变量,包括S, P(复用为SP), m_prev, m_new, l_prev, l_new; 为保留精度, SP采用double
-  double* SP = reinterpret_cast<double*>(ptr);    // double SP[Br][Bc]
+  //计算中间变量,包括S, P(共用为SP), m_prev, m_new, l_prev, l_new; 为保持精度中间变量全采用double
+  double* SP = reinterpret_cast<double*>(ptr);      // double SP[Br][Bc]
   ptr += Br * Bc * sizeof(double);
-  float* m_prev = reinterpret_cast<float*>(ptr);  // float m_prev[Br]
-  ptr += Br * sizeof(float);
-  float* m_new = reinterpret_cast<float*>(ptr);   // float m_new[Br] 
-  ptr += Br * sizeof(float);
-  float* l_prev = reinterpret_cast<float*>(ptr);  // float l_prev[Br]
-  ptr += Br * sizeof(float);
-  float* l_new = reinterpret_cast<float*>(ptr);   // float l_new[Br] 
-  ptr += Br * sizeof(float);  
+  double* m_prev = reinterpret_cast<double*>(ptr);  // double m_prev[Br]
+  ptr += Br * sizeof(double);
+  double* m_new = reinterpret_cast<double*>(ptr);   // double m_new[Br] 
+  ptr += Br * sizeof(double);
+  double* l_prev = reinterpret_cast<double*>(ptr);  // double l_prev[Br]
+  ptr += Br * sizeof(double);
+  double* l_new = reinterpret_cast<double*>(ptr);   // double l_new[Br] 
+  ptr += Br * sizeof(double);  
 
   //原始数据QKV和计算结果O; 全采用float
-  float* Q_sm = reinterpret_cast<float*>(ptr);    // float Q_sm[Br][head_dim] 
+  float* Q_sm = reinterpret_cast<float*>(ptr);      // float Q_sm[Br][head_dim] 
   ptr += Br * head_dim * sizeof(float);  
-  float* K_T_sm = reinterpret_cast<float*>(ptr);  // float K_T_sm[head_dim][Bc]
+  float* K_T_sm = reinterpret_cast<float*>(ptr);    // float K_T_sm[head_dim][Bc]
   ptr += head_dim * Bc * sizeof(float);
-  float* V_sm = reinterpret_cast<float*>(ptr);    // float V_sm[Br][head_dim] 
+  float* V_sm = reinterpret_cast<float*>(ptr);      // float V_sm[Br][head_dim] 
   ptr += Bc * head_dim * sizeof(float);  
-  float* O_sm = reinterpret_cast<float*>(ptr);    // float O_sm[Br][head_dim]
+  float* O_sm = reinterpret_cast<float*>(ptr);      // float O_sm[Br][head_dim]
 
   //定义访问宏
   /*#define   SP_AT(y, x)       SP[y][x]
@@ -308,20 +295,20 @@ __global__ void kernel_flashAttention(int batch_size, int target_seq_len, int sr
         for(int k = 0; k < head_dim; ++k){
           val0 += Q_sm_AT(tid_y, k) * K_T_sm_AT(k, tid_x);
         }
-        SP_AT(tid_y, tid_x) = double(val0) * scale_factor;//必须用double,对精度影响最大的计算步骤
+        SP_AT(tid_y, tid_x) = double(val0) * scale_factor;
       }
     }
     __syncthreads();
 
     
     //step-3: m_new = max(m_prev, rowMax(S))
-    float val1 = float(SP_AT(tid_y, tid_x));
-    val1 = warp_reduce_max(val1);
+    //double val1 = SP_AT(tid_y, tid_x);
+    //val1 = warp_reduce_max(val1);
     if(tid_x == 0 && tid_y < bound_tid_y){
-      /*double val1 = SP_AT(tid_y, 0);//手动实现非并行求行最大值
-      for(int h = 1; h < Bc; ++h){
-        val1 = (val1 < SP_AT(tid_y, h)) ? SP_AT(tid_y, h) : val1;
-      }*/
+      double val1 = SP_AT(tid_y, 0);//手动实现非并行求行最大值
+        for(int h = 1; h < Bc; ++h){
+          val1 = (val1 < SP_AT(tid_y, h)) ? SP_AT(tid_y, h) : val1;
+        }
       m_new[tid_y] = (val1 > m_prev[tid_y]) ? val1 : m_prev[tid_y];
     }
     __syncthreads();
@@ -329,7 +316,7 @@ __global__ void kernel_flashAttention(int batch_size, int target_seq_len, int sr
     //step-4: P = exp(S - m_new), point-wise
     if(tid_y < bound_tid_y && tid_x < bound_tid_x){
       if(is_compute){
-        SP_AT(tid_y, tid_x) = myexp<double>(SP_AT(tid_y, tid_x) - double(m_new[tid_y]));
+        SP_AT(tid_y, tid_x) = myexp<float>(SP_AT(tid_y, tid_x) - m_new[tid_y]);
       }
       else{
         SP_AT(tid_y, tid_x) = 0.0;
@@ -342,15 +329,14 @@ __global__ void kernel_flashAttention(int batch_size, int target_seq_len, int sr
     __syncthreads();
 
     //step-5: l_new = exp(m_prev - m_new) * l_prev + rowSum(P)
-    float val2 = float(SP_AT(tid_y, tid_x));
-    val2 = warp_reduce_sum(val2);
-    float exp_result = myexp<float>(m_prev[tid_y] - m_new[tid_y]);
-    //float exp_result = expf(m_prev[tid_y] - m_new[tid_y]);
+    //double val2 = SP_AT(tid_y, tid_x);
+    //val2 = warp_reduce_sum(val2);
+    double exp_result = myexp<float>(m_prev[tid_y] - m_new[tid_y]);
     if(tid_x == 0 && tid_y < bound_tid_y){
-      /*double val2 = 0.0;//手动实现非并行求rowSum
+      double val2 = 0.0;//手动实现非并行求rowSum
       for(int h = 0; h < Bc; ++h){
         val2 += SP_AT(tid_y, h);
-      }*/
+      }
       l_new[tid_y] = exp_result * l_prev[tid_y] + val2;
     }
     __syncthreads();
@@ -359,11 +345,11 @@ __global__ void kernel_flashAttention(int batch_size, int target_seq_len, int sr
     //step-6: O = 1/(exp(m_prev - m_new)) * O + P @ V
     if(tid_x < bound_tid_x && tid_y < bound_tid_y){//32路并行计算Oi的每一行
       for(int u = tid_x; u < head_dim; u += blockDim.x){
-        float val3 = 0.0;
+        double val3 = 0.0;
         for(int w = 0; w < Bc; ++w){//val3 += P[tid_y][w] * V[bid_y][Bc * j + w][bid_x / p][u];
-          val3 += float(SP_AT(tid_y, w)) * V_sm_AT(w, u);
+          val3 += SP_AT(tid_y, w) * double(V_sm_AT(w, u));
         }
-        O_sm_AT(tid_y, u) = O_sm_AT(tid_y, u) * exp_result + val3;
+        O_sm_AT(tid_y, u) = O_sm_AT(tid_y, u) * float(exp_result) + float(val3);
       }
     }
     __syncthreads();
@@ -414,37 +400,37 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   const size_t size_bytes_o = h_o.size() * sizeof(T);
   //const size_t size_bytes_lm = target_seq_len * query_heads * batch_size * sizeof(T);
   T *d_q, *d_k, *d_v, *d_o;//device端只支持裸指针
-  RUNTIME_CHECK(mcMalloc(&d_q, size_bytes_q));
-  RUNTIME_CHECK(mcMalloc(&d_k, size_bytes_k));
-  RUNTIME_CHECK(mcMalloc(&d_v, size_bytes_v));
-  RUNTIME_CHECK(mcMalloc(&d_o, size_bytes_o));
-  //RUNTIME_CHECK(mcMalloc(&d_l, size_bytes_lm));//l向量,长度 = target_seq_len
-  //RUNTIME_CHECK(mcMalloc(&d_m, size_bytes_lm));//m向量,长度 = target_seq_len
+  RUNTIME_CHECK(cudaMalloc(&d_q, size_bytes_q));
+  RUNTIME_CHECK(cudaMalloc(&d_k, size_bytes_k));
+  RUNTIME_CHECK(cudaMalloc(&d_v, size_bytes_v));
+  RUNTIME_CHECK(cudaMalloc(&d_o, size_bytes_o));
+  //RUNTIME_CHECK(cudaMalloc(&d_l, size_bytes_lm));//l向量,长度 = target_seq_len
+  //RUNTIME_CHECK(cudaMalloc(&d_m, size_bytes_lm));//m向量,长度 = target_seq_len
 
   //step2: 拷贝数据from host to device
-  RUNTIME_CHECK(mcMemcpy(d_q, h_q.data(), size_bytes_q, mcMemcpyHostToDevice));
-  RUNTIME_CHECK(mcMemcpy(d_k, h_k.data(), size_bytes_k, mcMemcpyHostToDevice));
-  RUNTIME_CHECK(mcMemcpy(d_v, h_v.data(), size_bytes_v, mcMemcpyHostToDevice));
-  RUNTIME_CHECK(mcMemset(d_o, 0, size_bytes_o));//d_o初始化为全0
+  RUNTIME_CHECK(cudaMemcpy(d_q, h_q.data(), size_bytes_q, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_k, h_k.data(), size_bytes_k, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), size_bytes_v, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemset(d_o, 0, size_bytes_o));//d_o初始化为全0
 
   //step3: device端计算
-  int Br = 32, Bc = 32;
+  int Br = 16, Bc = 16;
   int grid_dim_z = (target_seq_len + Br - 1) / Br;
   dim3 block_dim(Br, Bc);
   dim3 grid_dim(query_heads, batch_size, grid_dim_z);
-  size_t smem_size = (Br * Bc) * sizeof(double) + (Br * 4) * sizeof(float) + (Br * head_dim * 2 + Bc * head_dim * 2) * sizeof(float);
+  size_t smem_size = (Br * Bc + Br * 4) * sizeof(double) + (Br * head_dim * 2 + Bc * head_dim * 2) * sizeof(float);
   
   kernel_flashAttention<T><<<grid_dim, block_dim, smem_size>>>(batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, is_causal, d_q, d_k, d_v, d_o);
   //注意核函数返回类型只能为void
 
   //step4: 拷贝数据from device to host(not needed)
-  RUNTIME_CHECK(mcMemcpy(h_o.data(), d_o, size_bytes_o, mcMemcpyDeviceToHost));
+  RUNTIME_CHECK(cudaMemcpy(h_o.data(), d_o, size_bytes_o, cudaMemcpyDeviceToHost));
 
   //step5: free memory
-  RUNTIME_CHECK(mcFree(d_q));
-  RUNTIME_CHECK(mcFree(d_k));
-  RUNTIME_CHECK(mcFree(d_v));
-  RUNTIME_CHECK(mcFree(d_o));
+  RUNTIME_CHECK(cudaFree(d_q));
+  RUNTIME_CHECK(cudaFree(d_k));
+  RUNTIME_CHECK(cudaFree(d_v));
+  RUNTIME_CHECK(cudaFree(d_o));
 
   //std::cout << "h_o[0] is: " << float(h_o[0]) << std::endl;
   return;

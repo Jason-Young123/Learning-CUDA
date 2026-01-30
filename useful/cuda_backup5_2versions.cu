@@ -1,7 +1,11 @@
 #include <vector>
-#include <common/maca_fp16.h>
+#include <cuda_fp16.h>
 
 #include "../tester/utils.h"
+
+
+#define TRACE_ASYNC
+#define ATTENTION_ASYNC
 
 /**
  * @brief Computes the trace of a matrix.
@@ -17,7 +21,6 @@
  * @param cols Number of columns in the matrix.
  * @return The trace (sum of diagonal values) of the matrix.
  */
-
 
 template <typename T>
 __device__ T warp_reduce_sum(T val){
@@ -76,23 +79,81 @@ std::vector<T> extract_diag(const std::vector<T> & h_input, size_t rows, size_t 
 }
 
 
+
+#ifdef TRACE_ASYNC
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   //step-0: basic check
-  //printf("=== MACA Device Properties ===\n");
-  //mcDeviceProp_t prop; 
+  //printf("=== Nvidia Device Properties ===\n");
+  //cudaDeviceProp prop; 
   //int device_id = 0; 
-  //mcGetDeviceProperties(&prop, device_id);
+  //cudaGetDeviceProperties(&prop, device_id);
   
   // 静态property
   //printf("Device Name: %s\n", prop.name);
   //printf("  - Max Threads per Block: %d\n", prop.maxThreadsPerBlock);//1024
-  //printf("  - Max Block Dimensions: (%d, %d, %d)\n", prop.maxThreadsDim[0], prop.maxThreadsDim[1], prop.maxThreadsDim[2]);//(1024, 1024, 1024)
-  //printf("  - Max Grid Dimensions: (%d, %d, %d)\n", prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);//(2147483647, 2147483647, 2147483647)
-  //printf("  - Warp Size: %d\n", prop.warpSize);//64
-  //printf("  - Shared Memory per Block: %zu bytes\n", prop.sharedMemPerBlock);//64KB
-  //printf("  - Number of Multiprocessors: %d\n", prop.multiProcessorCount);//104
+  //printf("  - Max Block Dimensions: (%d, %d, %d)\n", prop.maxThreadsDim[0], prop.maxThreadsDim[1], prop.maxThreadsDim[2]);//(1024, 1024, 64)
+  //printf("  - Max Grid Dimensions: (%d, %d, %d)\n", prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);//(2147483647, 65535, 65535)
+  //printf("  - Warp Size: %d\n", prop.warpSize);//32 
+  //printf("  - Shared Memory per Block: %zu bytes\n", prop.sharedMemPerBlock);//48KB
+  //printf("  - Number of Multiprocessors: %d\n", prop.multiProcessorCount);//108
 
+  if(!std::min(rows, cols)){
+    //std::cerr << "Matrix Shape Invalid" << std::endl;
+    return T(0);
+  }
+
+  //step-1: 提取对角元
+  std::vector<T> h_diag = extract_diag<T>(h_input, rows, cols);
+
+  //step-2: 初始化,分配device端空间
+  cudaStream_t stream;
+  cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+
+  const size_t size_bytes = h_diag.size() * sizeof(T);
+  T *d_diag, *d_trace;//device端只支持裸指针
+  RUNTIME_CHECK(cudaMallocAsync(&d_diag, size_bytes, stream));
+  RUNTIME_CHECK(cudaMallocAsync(&d_trace, sizeof(T), stream));
+
+  //step-3: 拷贝数据from host to device
+  RUNTIME_CHECK(cudaMemcpyAsync(d_diag, h_diag.data(), size_bytes, cudaMemcpyHostToDevice, stream));
+  RUNTIME_CHECK(cudaMemsetAsync(d_trace, 0, sizeof(T), stream));
+
+  //step-4: device端计算
+  int block_dim = 1024;
+  int grid_dim = std::min((h_diag.size() + block_dim - 1)/block_dim, size_t(8));//设置上限
+  trace_calc<T><<<grid_dim, block_dim, 0, stream>>>(d_trace, d_diag, h_diag.size());//调用device端函数进行trace计算//注意核函数返回类型只能为void
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
+
+  //step-5: 拷贝数据from device to host
+  T h_trace = T(0);
+  RUNTIME_CHECK(cudaMemcpyAsync(&h_trace, d_trace, sizeof(T), cudaMemcpyDeviceToHost, stream));
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
+
+  //step5: free memory
+  RUNTIME_CHECK(cudaFreeAsync(d_diag, stream));
+  RUNTIME_CHECK(cudaFreeAsync(d_trace, stream));
+
+  return h_trace;
+}
+
+#else
+template <typename T>
+T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
+  //step-0: basic check
+  //printf("=== Nvidia Device Properties ===\n");
+  //cudaDeviceProp prop; 
+  //int device_id = 0; 
+  //cudaGetDeviceProperties(&prop, device_id);
+  
+  // 静态property
+  //printf("Device Name: %s\n", prop.name);
+  //printf("  - Max Threads per Block: %d\n", prop.maxThreadsPerBlock);//1024
+  //printf("  - Max Block Dimensions: (%d, %d, %d)\n", prop.maxThreadsDim[0], prop.maxThreadsDim[1], prop.maxThreadsDim[2]);//(1024, 1024, 64)
+  //printf("  - Max Grid Dimensions: (%d, %d, %d)\n", prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);//(2147483647, 65535, 65535)
+  //printf("  - Warp Size: %d\n", prop.warpSize);//32 
+  //printf("  - Shared Memory per Block: %zu bytes\n", prop.sharedMemPerBlock);//48KB
+  //printf("  - Number of Multiprocessors: %d\n", prop.multiProcessorCount);//108
 
   if(!std::min(rows, cols)){
     //std::cerr << "Matrix Shape Invalid" << std::endl;
@@ -105,12 +166,12 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   //step-2: 初始化,分配device端空间
   const size_t size_bytes = h_diag.size() * sizeof(T);
   T *d_diag, *d_trace;//device端只支持裸指针
-  RUNTIME_CHECK(mcMalloc(&d_diag, size_bytes));
-  RUNTIME_CHECK(mcMalloc(&d_trace, sizeof(T)));
+  RUNTIME_CHECK(cudaMalloc(&d_diag, size_bytes));
+  RUNTIME_CHECK(cudaMalloc(&d_trace, sizeof(T)));
 
   //step-3: 拷贝数据from host to device
-  RUNTIME_CHECK(mcMemcpy(d_diag, h_diag.data(), size_bytes, mcMemcpyHostToDevice));
-  RUNTIME_CHECK(mcMemset(d_trace, 0, sizeof(T)));
+  RUNTIME_CHECK(cudaMemcpy(d_diag, h_diag.data(), size_bytes, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemset(d_trace, 0, sizeof(T)));
 
   //step-4: device端计算
   int block_dim = 1024;
@@ -120,15 +181,16 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
   //step-5: 拷贝数据from device to host
   T h_trace = T(0);
-  RUNTIME_CHECK(mcMemcpy(&h_trace, d_trace, sizeof(T), mcMemcpyDeviceToHost));
+  RUNTIME_CHECK(cudaMemcpy(&h_trace, d_trace, sizeof(T), cudaMemcpyDeviceToHost));
 
   //step5: free memory
-  RUNTIME_CHECK(mcFree(d_diag));
-  RUNTIME_CHECK(mcFree(d_trace));
+  RUNTIME_CHECK(cudaFree(d_diag));
+  RUNTIME_CHECK(cudaFree(d_trace));
 
-  //printf("the result is %f\n", float(h_trace));
   return h_trace;
 }
+#endif
+
 
 
 
@@ -399,7 +461,62 @@ __global__ void kernel_flashAttention(int batch_size, int target_seq_len, int sr
 }
 
 
+#ifdef ATTENTION_ASYNC
+template <typename T>
+void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
+                    const std::vector<T>& h_v, std::vector<T>& h_o,
+                    int batch_size, int target_seq_len, int src_seq_len, 
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+  //step0: basic check
 
+  //step1: 初始化,预留device端空间
+  cudaStream_t stream;
+  cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+
+  const size_t size_bytes_q = h_q.size() * sizeof(T);
+  const size_t size_bytes_k = h_k.size() * sizeof(T);
+  const size_t size_bytes_v = h_v.size() * sizeof(T);
+  const size_t size_bytes_o = h_o.size() * sizeof(T);
+
+  T *d_q, *d_k, *d_v, *d_o;//device端只支持裸指针
+  RUNTIME_CHECK(cudaMallocAsync(&d_q, size_bytes_q, stream));
+  RUNTIME_CHECK(cudaMallocAsync(&d_k, size_bytes_k, stream));
+  RUNTIME_CHECK(cudaMallocAsync(&d_v, size_bytes_v, stream));
+  RUNTIME_CHECK(cudaMallocAsync(&d_o, size_bytes_o, stream));
+
+  //step2: 拷贝数据from host to device
+  RUNTIME_CHECK(cudaMemcpyAsync(d_q, h_q.data(), size_bytes_q, cudaMemcpyHostToDevice, stream));
+  RUNTIME_CHECK(cudaMemcpyAsync(d_k, h_k.data(), size_bytes_k, cudaMemcpyHostToDevice, stream));
+  RUNTIME_CHECK(cudaMemcpyAsync(d_v, h_v.data(), size_bytes_v, cudaMemcpyHostToDevice, stream));
+  RUNTIME_CHECK(cudaMemsetAsync(d_o, 0, size_bytes_o, stream));//d_o初始化为全0
+
+  //step3: device端计算
+  int Br = 32, Bc = 32;
+  int grid_dim_z = (target_seq_len + Br - 1) / Br;
+  dim3 block_dim(Br, Bc);
+  dim3 grid_dim(query_heads, batch_size, grid_dim_z);
+  size_t smem_size = (Br * Bc) * sizeof(double) + (Br * 4) * sizeof(float) + (Br * head_dim * 2 + Bc * head_dim * 2) * sizeof(float);
+
+  kernel_flashAttention<T><<<grid_dim, block_dim, smem_size, stream>>>(batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, is_causal, d_q, d_k, d_v, d_o);//注意核函数返回类型只能为void
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
+
+  //step4: 拷贝数据from device to host(not needed)
+  RUNTIME_CHECK(cudaMemcpyAsync(h_o.data(), d_o, size_bytes_o, cudaMemcpyDeviceToHost, stream));
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
+
+  //step5: free memory
+  RUNTIME_CHECK(cudaFreeAsync(d_q, stream));
+  RUNTIME_CHECK(cudaFreeAsync(d_k, stream));
+  RUNTIME_CHECK(cudaFreeAsync(d_v, stream));
+  RUNTIME_CHECK(cudaFreeAsync(d_o, stream));
+
+  //RUNTIME_CHECK(cudaStreamSynchronize(stream));
+  //RUNTIME_CHECK(cudaStreamDestroy(stream));
+  //std::cout << "h_o[0] is: " << float(h_o[0]) << std::endl;
+  return;
+}
+
+#else
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
@@ -414,18 +531,18 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   const size_t size_bytes_o = h_o.size() * sizeof(T);
   //const size_t size_bytes_lm = target_seq_len * query_heads * batch_size * sizeof(T);
   T *d_q, *d_k, *d_v, *d_o;//device端只支持裸指针
-  RUNTIME_CHECK(mcMalloc(&d_q, size_bytes_q));
-  RUNTIME_CHECK(mcMalloc(&d_k, size_bytes_k));
-  RUNTIME_CHECK(mcMalloc(&d_v, size_bytes_v));
-  RUNTIME_CHECK(mcMalloc(&d_o, size_bytes_o));
-  //RUNTIME_CHECK(mcMalloc(&d_l, size_bytes_lm));//l向量,长度 = target_seq_len
-  //RUNTIME_CHECK(mcMalloc(&d_m, size_bytes_lm));//m向量,长度 = target_seq_len
+  RUNTIME_CHECK(cudaMalloc(&d_q, size_bytes_q));
+  RUNTIME_CHECK(cudaMalloc(&d_k, size_bytes_k));
+  RUNTIME_CHECK(cudaMalloc(&d_v, size_bytes_v));
+  RUNTIME_CHECK(cudaMalloc(&d_o, size_bytes_o));
+  //RUNTIME_CHECK(cudaMalloc(&d_l, size_bytes_lm));//l向量,长度 = target_seq_len
+  //RUNTIME_CHECK(cudaMalloc(&d_m, size_bytes_lm));//m向量,长度 = target_seq_len
 
   //step2: 拷贝数据from host to device
-  RUNTIME_CHECK(mcMemcpy(d_q, h_q.data(), size_bytes_q, mcMemcpyHostToDevice));
-  RUNTIME_CHECK(mcMemcpy(d_k, h_k.data(), size_bytes_k, mcMemcpyHostToDevice));
-  RUNTIME_CHECK(mcMemcpy(d_v, h_v.data(), size_bytes_v, mcMemcpyHostToDevice));
-  RUNTIME_CHECK(mcMemset(d_o, 0, size_bytes_o));//d_o初始化为全0
+  RUNTIME_CHECK(cudaMemcpy(d_q, h_q.data(), size_bytes_q, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_k, h_k.data(), size_bytes_k, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), size_bytes_v, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemset(d_o, 0, size_bytes_o));//d_o初始化为全0
 
   //step3: device端计算
   int Br = 32, Bc = 32;
@@ -438,19 +555,18 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   //注意核函数返回类型只能为void
 
   //step4: 拷贝数据from device to host(not needed)
-  RUNTIME_CHECK(mcMemcpy(h_o.data(), d_o, size_bytes_o, mcMemcpyDeviceToHost));
+  RUNTIME_CHECK(cudaMemcpy(h_o.data(), d_o, size_bytes_o, cudaMemcpyDeviceToHost));
 
   //step5: free memory
-  RUNTIME_CHECK(mcFree(d_q));
-  RUNTIME_CHECK(mcFree(d_k));
-  RUNTIME_CHECK(mcFree(d_v));
-  RUNTIME_CHECK(mcFree(d_o));
+  RUNTIME_CHECK(cudaFree(d_q));
+  RUNTIME_CHECK(cudaFree(d_k));
+  RUNTIME_CHECK(cudaFree(d_v));
+  RUNTIME_CHECK(cudaFree(d_o));
 
   //std::cout << "h_o[0] is: " << float(h_o[0]) << std::endl;
   return;
 }
-
-
+#endif
 
 
 // *********************************************************************
